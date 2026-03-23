@@ -187,6 +187,7 @@ local function get_state(win, buf, top, bottom)
   ---@class snacks.indent.State
   ---@field indents table<number, number>
   ---@field blanks table<number, boolean>
+  ---@field folded table<number, boolean>
   local state = {
     win = win,
     buf = buf,
@@ -198,6 +199,7 @@ local function get_state(win, buf, top, bottom)
     shiftwidth = vim.bo[buf].shiftwidth,
     indents = prev and prev.indents or { [0] = 0 },
     blanks = prev and prev.blanks or {},
+    folded = {}, -- lines inside closed folds (refreshed each redraw)
     indent_offset = 0, -- the start column of the indent guides
     breakindent = vim.wo[win].breakindent and vim.wo[win].wrap,
   }
@@ -245,35 +247,47 @@ function M.on_win(win, buf, top, bottom)
   local indents = state.indents
   vim.api.nvim_buf_call(buf, function()
     local parent_indent, current_indent ---@type number, number
-    for l = state.top, state.bottom do
-      local indent = indents[l]
-      if not indent then
-        stats.indents = stats.indents + 1
-        local next = vim.fn.nextnonblank(l)
-        -- Indent for a blank line is the minimum of the previous and next non-blank line.
-        -- If the previous and next non-blank lines have different indents, add shiftwidth.
-        if next ~= l then
-          state.blanks[l] = true
-          local prev = vim.fn.prevnonblank(l)
-          indents[prev] = indents[prev] or vim.fn.indent(prev)
-          indents[next] = indents[next] or vim.fn.indent(next)
-          indent = math.min(indents[prev], indents[next])
-          if indents[prev] ~= indents[next] and indent > 0 then
-            indent = indent + state.shiftwidth
-          end
-        else
-          indent = vim.fn.indent(l)
+    local l = state.top
+    while l <= state.bottom do
+      -- Skip folded ranges: overlay extmarks on fold lines
+      -- overwrite characters in the rendered foldtext
+      local fold_end = vim.fn.foldclosedend(l)
+      if fold_end ~= -1 then
+        for fl = l, fold_end do
+          state.folded[fl] = true
         end
-        indents[l] = indent
-      end
-      if indent ~= current_indent then
-        parent_indent = current_indent or indent
-        current_indent = indent
-      end
-      indent = math.min(indent, parent_indent + state.shiftwidth)
-      local extmarks = show_indent and indent > 0 and get_extmarks(indent, state)
-      for _, opts in ipairs(extmarks or {}) do
-        vim.api.nvim_buf_set_extmark(buf, ns, l - 1, 0, opts)
+        l = fold_end + 1
+      else
+        local indent = indents[l]
+        if not indent then
+          stats.indents = stats.indents + 1
+          local next = vim.fn.nextnonblank(l)
+          -- Indent for a blank line is the minimum of the previous and next non-blank line.
+          -- If the previous and next non-blank lines have different indents, add shiftwidth.
+          if next ~= l then
+            state.blanks[l] = true
+            local prev = vim.fn.prevnonblank(l)
+            indents[prev] = indents[prev] or vim.fn.indent(prev)
+            indents[next] = indents[next] or vim.fn.indent(next)
+            indent = math.min(indents[prev], indents[next])
+            if indents[prev] ~= indents[next] and indent > 0 then
+              indent = indent + state.shiftwidth
+            end
+          else
+            indent = vim.fn.indent(l)
+          end
+          indents[l] = indent
+        end
+        if indent ~= current_indent then
+          parent_indent = current_indent or indent
+          current_indent = indent
+        end
+        indent = math.min(indent, parent_indent + state.shiftwidth)
+        local extmarks = show_indent and indent > 0 and get_extmarks(indent, state)
+        for _, opts in ipairs(extmarks or {}) do
+          vim.api.nvim_buf_set_extmark(buf, ns, l - 1, 0, opts)
+        end
+        l = l + 1
       end
     end
   end)
@@ -332,18 +346,20 @@ function M.render_scope(scope, state)
   end
 
   for l = from, to do
-    local i = state.indents[l]
-    if (i and i > indent) or vim.g.snacks_indent_overlap or state.blanks[l] then
-      vim.api.nvim_buf_set_extmark(scope.buf, ns, l - 1, 0, {
-        virt_text = { { config.scope.char, hl } },
-        virt_text_pos = "overlay",
-        virt_text_win_col = col,
-        hl_mode = "combine",
-        priority = config.scope.priority,
-        strict = false,
-        ephemeral = true,
-        virt_text_repeat_linebreak = has_repeat_lb and state.breakindent or nil,
-      })
+    if not state.folded[l] then
+      local i = state.indents[l]
+      if (i and i > indent) or vim.g.snacks_indent_overlap or state.blanks[l] then
+        vim.api.nvim_buf_set_extmark(scope.buf, ns, l - 1, 0, {
+          virt_text = { { config.scope.char, hl } },
+          virt_text_pos = "overlay",
+          virt_text_win_col = col,
+          hl_mode = "combine",
+          priority = config.scope.priority,
+          strict = false,
+          ephemeral = true,
+          virt_text_repeat_linebreak = has_repeat_lb and state.breakindent or nil,
+        })
+      end
     end
   end
 end
@@ -379,16 +395,18 @@ function M.render_chunk(scope, state)
   end
 
   for l = from, to do
-    local i = state.indents[l] - state.leftcol
-    if l == scope.from then -- top line
-      if state.breakindent then
-        add(l, char.vertical, true)
+    if not state.folded[l] then
+      local i = state.indents[l] - state.leftcol
+      if l == scope.from then -- top line
+        if state.breakindent then
+          add(l, char.vertical, true)
+        end
+        add(l, char.corner_top .. (char.horizontal):rep(i - col - 1))
+      elseif l == scope.to then -- bottom line
+        add(l, char.corner_bottom .. (char.horizontal):rep(i - col - 2) .. char.arrow)
+      elseif i and i > col then -- middle line
+        add(l, char.vertical, state.breakindent)
       end
-      add(l, char.corner_top .. (char.horizontal):rep(i - col - 1))
-    elseif l == scope.to then -- bottom line
-      add(l, char.corner_bottom .. (char.horizontal):rep(i - col - 2) .. char.arrow)
-    elseif i and i > col then -- middle line
-      add(l, char.vertical, state.breakindent)
     end
   end
 end
